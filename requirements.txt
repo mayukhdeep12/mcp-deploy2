@@ -1,0 +1,6 @@
+fastmcp
+fastapi
+uvicorn
+yfinance
+duckduckgo-search
+matplotlib
