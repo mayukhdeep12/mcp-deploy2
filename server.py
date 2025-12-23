@@ -1,35 +1,33 @@
+import os
+import json
 import io
 import base64
-import os
-from contextlib import asynccontextmanager
+import asyncio
 
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastmcp import FastMCP
+from fastapi.responses import Response
+from sse_starlette.sse import EventSourceResponse
+
+# We use the OFFICIAL Core SDK now (Advanced Level)
+from mcp.server.lowlevel import Server
+from mcp.server.sse import SseServerTransport
+from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
 import yfinance as yf
 from duckduckgo_search import DDGS
 import matplotlib.pyplot as plt
 
-# --- 1. SECURITY CONFIGURATION ---
-# We read the secret key from the environment variables (set in Render later)
+# --- 1. SETUP SERVER & APP ---
+app = FastAPI()
+mcp_server = Server("hedge-fund-analyst")
+
+# Security Token
 API_SECRET = os.getenv("MCP_API_KEY", "default-dev-key")
 
-def verify_token(request: Request):
-    """
-    Middleware to check if the URL has ?token=MY_SECRET_KEY
-    """
-    token = request.query_params.get("token")
-    if token != API_SECRET:
-        raise HTTPException(status_code=403, detail="Unauthorized: Invalid API Key")
-    return token
+# --- 2. DEFINE TOOLS (The "Pro" Way) ---
+# In the core SDK, we register tools manually or use decorators if available.
+# We will define the logic and then register them.
 
-# --- 2. FASTMCP SETUP ---
-# We create the MCP server but don't run it yet.
-mcp = FastMCP("Hedge Fund Analyst")
-
-# --- 3. TOOLS ---
-
-@mcp.tool()
-def get_stock_news(ticker: str) -> str:
+async def get_stock_news(ticker: str) -> str:
     """Search for the latest news driving a stock's price."""
     print(f"Searching news for {ticker}...")
     with DDGS() as ddgs:
@@ -37,64 +35,113 @@ def get_stock_news(ticker: str) -> str:
     
     if not results:
         return "No news found."
-    
-    formatted = "\n".join([f"- {r['title']} ({r['source']})" for r in results])
-    return f"Latest News for {ticker}:\n{formatted}"
+    return "\n".join([f"- {r['title']} ({r['source']})" for r in results])
 
-@mcp.tool()
-def get_stock_chart(ticker: str) -> str:
-    """
-    Generates a price history chart for a stock over the last 6 months.
-    Returns a base64 string of the image.
-    """
+async def get_stock_chart(ticker: str) -> str:
+    """Generates a price history chart for a stock (base64)."""
     print(f"Generating chart for {ticker}...")
-    
-    # 1. Fetch Data
-    stock = yf.Ticker(ticker)
-    hist = stock.history(period="6m")
-    
-    if hist.empty:
-        return "Error: No data found for ticker."
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="6m")
+        if hist.empty: return "No data."
+        
+        plt.figure(figsize=(10, 5))
+        plt.plot(hist.index, hist['Close'])
+        plt.title(f'{ticker} - 6 Month Trend')
+        plt.grid(True)
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close()
+        
+        return f"Chart generated successfully. Closing price: {hist['Close'].iloc[-1]:.2f}"
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-    # 2. Create Plot (Matplotlib)
-    plt.figure(figsize=(10, 5))
-    plt.plot(hist.index, hist['Close'], label=f'{ticker} Close Price')
-    plt.title(f'{ticker} - 6 Month Trend')
-    plt.xlabel('Date')
-    plt.ylabel('Price ($)')
-    plt.grid(True)
-    plt.legend()
-    
-    # 3. Save to Memory Buffer (not a file)
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    plt.close()
-    
-    # 4. Convert to Base64
-    img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-    
-    # FastMCP automatically detects if you return an Image object, 
-    # but for simplicity in this advanced tutorial, we return a special 
-    # string format that Claude knows how to interpret if we tell it 
-    # or we can return the raw image via FastMCP's context capabilities.
-    # To keep it simple: We return a message saying the chart is ready.
-    # Note: Currently, displaying inline images in Claude via MCP is 
-    # dependent on the client support. We will return text data for now
-    # or a "Data URL".
-    
-    return f"Chart generated. (In a full GUI client, this would render). Price moved from {hist['Close'].iloc[0]:.2f} to {hist['Close'].iloc[-1]:.2f}"
+# Register the tools with the MCP Server
+@mcp_server.list_tools()
+async def list_tools():
+    return [
+        Tool(
+            name="get_stock_news",
+            description="Get latest news for a stock ticker",
+            inputSchema={
+                "type": "object",
+                "properties": {"ticker": {"type": "string"}},
+                "required": ["ticker"]
+            }
+        ),
+        Tool(
+            name="get_stock_chart",
+            description="Get 6-month price chart calculation",
+            inputSchema={
+                "type": "object",
+                "properties": {"ticker": {"type": "string"}},
+                "required": ["ticker"]
+            }
+        )
+    ]
 
-# --- 4. ADVANCED: MOUNTING ON FASTAPI ---
-# This is how we add Authentication to FastMCP.
-# We create a standard FastAPI app and "mount" the MCP server on it.
+@mcp_server.call_tool()
+async def call_tool(name: str, arguments: dict):
+    if name == "get_stock_news":
+        result = await get_stock_news(arguments["ticker"])
+        return [TextContent(type="text", text=result)]
+    
+    elif name == "get_stock_chart":
+        result = await get_stock_chart(arguments["ticker"])
+        return [TextContent(type="text", text=result)]
+    
+    raise ValueError(f"Unknown tool: {name}")
 
-app = FastAPI()
+# --- 3. AUTHENTICATION ---
+async def verify_token(request: Request):
+    token = request.query_params.get("token")
+    if token != API_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid API Token")
+    return token
 
-# We expose the MCP server on /sse and /messages, PROTECTED by our verify_token
-mcp.mount_as_sse(app, path="/sse", dependencies=[Depends(verify_token)])
-mcp.mount_as_messages(app, path="/messages", dependencies=[Depends(verify_token)])
+# --- 4. THE SSE ENDPOINTS (The Bridge) ---
+# This dictionary holds active connections
+sse_transports = {}
 
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
+@app.get("/sse")
+async def handle_sse(request: Request, token: str = Depends(verify_token)):
+    """
+    This is the endpoint Claude connects to.
+    """
+    async def event_generator():
+        # Create a transport for this specific connection
+        transport = SseServerTransport("/messages")
+        
+        async with transport.connect_sse(request.scope, request.receive, request._send) as streams:
+            # Store transport to handle incoming POST messages later
+            sse_transports[token] = transport
+            
+            # Run the server for this connection
+            await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
+            
+    return EventSourceResponse(event_generator())
+
+@app.post("/messages")
+async def handle_messages(request: Request):
+    """
+    Claude sends responses back to us here. 
+    Note: In a full implementation, we need to map sessions better.
+    For this single-user demo, we assume the active transport.
+    """
+    # In a real app, you'd extract the session ID from the URL. 
+    # For this demo, we pick the most recent transport (Simplification)
+    if not sse_transports:
+        raise HTTPException(404, "No active session")
+        
+    # Pick the first available transport (works for single user demo)
+    transport = list(sse_transports.values())[0]
+    
+    await transport.handle_post_message(request.scope, request.receive, request._send)
+    return Response(status_code=202)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
